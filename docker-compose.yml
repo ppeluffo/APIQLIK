@@ -1,0 +1,57 @@
+services:
+
+  apiqlik_pgsql:
+    build:
+      context: ./bdatos
+      dockerfile: Dockerfile
+    image: spymovil/apiqlik_pgsql:latest
+    restart: always
+    ports:
+      - 5434:5432
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: pexco599
+      POSTGRES_DB: bd_apiqlik
+    volumes:
+      - ./datos:/var/lib/postgresql/data
+
+  apiqlik_api:
+    build:
+      context: .
+      dockerfile: api.Dockerfile
+    image: spymovil/apiqlik_api:latest
+    ports:
+      - 5022:5022
+    restart: always
+    depends_on:
+      - apiqlik_pgsql
+    environment:
+      PYTHONUNBUFFERED: 1
+      MAX_LINES: 5
+      PGSQL_HOST: apiqlik_pgsql
+      PGSQL_PORT: 5432
+      PGSQL_USER: admin
+      PGSQL_PASSWD: pexco599
+      PGSQL_BD: bd_apiqlik
+
+  apiqlik_dataloader:
+    build:
+      context: .
+      dockerfile: dataloader.Dockerfile
+    image: spymovil/apiqlik_dataloader:latest
+    restart: always
+    depends_on:
+      - apiqlik_pgsql
+    environment:
+      PYTHONUNBUFFERED: 1
+      PGSQL_HOST: apiqlik_pgsql
+      PGSQL_PORT: 5432
+      PGSQL_USER: admin
+      PGSQL_PASSWD: pexco599
+      PGSQL_BD: bd_apiqlik
+      APIDATOS_HOST: '192.168.0.8'
+      APIDATOS_PORT: 5300
+      APIDATOS_USERKEY: L92HIJVRL7RJMP7EO9GF
+      SLEEP_TIME: 60
+   
+   
