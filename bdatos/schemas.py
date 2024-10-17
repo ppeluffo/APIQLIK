@@ -22,6 +22,7 @@ tb_control_acceso = Table('control_acceso', metadata,
     Column('id', Integer(), primary_key=True),
     Column('username', String(50), nullable=False, unique=True),
     Column('password', String(50), nullable=False ),
+    Column('last_access', DateTime(), default=datetime.now, onupdate=datetime.now ),
     Column('last_row', Integer())
     )
 

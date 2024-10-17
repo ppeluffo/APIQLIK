@@ -23,13 +23,13 @@ import logging
 from flask import Flask, request, jsonify,  Response
 from flask_restful import Resource, Api, reqparse
 from flask_httpauth import HTTPBasicAuth
-from sqlalchemy import select, bindparam, update, Text
+from sqlalchemy import select, bindparam, update, Text, and_
 from sqlalchemy.dialects.postgresql import insert
 import datetime as dt
 from base_datos import Bd
 import schemas as scm
 
-MAX_LINES = os.environ.get('MAX_LINES','4')
+MAX_LINES = os.environ.get('MAX_LINES','10000')
 
 API_VERSION = 'R001 @ 2024-10-09'
 
@@ -88,7 +88,7 @@ class Ping(Resource):
     def get(self):
         ''' Retorna la versión. Solo a efectos de ver que la api responda
         '''
-        return {'rsp':'OK','version':API_VERSION },200
+        return {'rsp':'OK','version':API_VERSION, 'MAX_LINES':MAX_LINES },200
 
 class Dlgids(Resource):
     '''
@@ -272,16 +272,71 @@ class Download(Resource):
         response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
         return response
  
+class Read(Resource):
+    ''' 
+    Devuelve registros en modo csv sin marcarlos.
+    '''
+    def __init__(self):
+        self.bd = Bd()
+        self.tables = scm
+        
+    @auth.login_required
+    def get(self):
+        '''
+        Leo los datos entre las 2 fechas: fechaini, fechafin y retorno todos
+        '''
+        parser = reqparse.RequestParser()
+        parser.add_argument('fechaini',type=str,location='args',required=True)
+        parser.add_argument('fechafin',type=str,location='args',required=True)
+        args=parser.parse_args()
+        fechaini = args['fechaini']
+        fechafin = args['fechafin']
+
+        sel  = select( self.tables.tb_datos ).where(
+            and_(
+                self.tables.tb_datos.c.fechadata >= bindparam('fechaini'),
+                self.tables.tb_datos.c.fechadata <= bindparam('fechafin')
+            )
+        )
+        
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [Download] no puedo conectarme a la BD.")
+            return {'status':'ERR', 'code': 404, 'rsp':'ERROR Conexion a BD'}
+        #
+        try:
+            rp = self.bd.conn.execute(sel,{'fechaini':fechaini, 'fechafin':fechafin})
+        except Exception as ex:
+            print(f'ApiQlik ERROR [Download] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return {'status':'ERR', 'code': 404, 'rsp':'ERROR BD select'}               
+        #
+        # Las consultas siempre devuelven un result_proxy
+        print(f"ApiQlik Read from {fechaini} to {fechafin}")
+
+        nro_lines = 0
+        csv_data = ""
+        for rcd in rp.fetchall():
+            (id,fechasys,fechadata,dlgid,tag,value) = rcd
+            line = f'{id},{fechasys},{fechadata},{dlgid},{tag},{value}\n'
+            csv_data += line
+            nro_lines += 1
+        #
+        self.bd.close()
+        response = Response(csv_data, content_type="text/csv")
+        response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
+        return response
+ 
 api.add_resource( Ping, '/apiqlik/ping')
 api.add_resource( Help, '/apiqlik/help')
 api.add_resource( Dlgids, '/apiqlik/dlgids')
 api.add_resource( Download, '/apiqlik/download')
+api.add_resource( Read, '/apiqlik/read')
 
 if __name__ != '__main__':
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    app.logger.info( f'Starting APIQLIK' )
+    app.logger.info( f'Starting APIQLIK, MAX_LINES={MAX_LINES}' )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5022, debug=True)

@@ -88,9 +88,15 @@ class Dataloader:
             self.l_datos = []
             return
     
-        if req.status_code != 200:
-            print('ERROR [read_data_chunk] status_code != 200 !!!')
+        if req.status_code == 204:
+            print('WARN [read_data_chunk] no data!!!')
             self.l_datos = []
+            return
+
+        if req.status_code != 200:
+            print(f'ERROR [read_data_chunk] status_code != 200 {req.status_code} !!!')
+            self.l_datos = []
+            return
         #
         # Retorno la lista de datos recibida. Cada datos es una lista
         jd_rsp = req.json()

@@ -9,7 +9,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 
 PGSQL_HOST = os.environ.get('PGSQL_HOST','127.0.0.1')
-PGSQL_PORT = os.environ.get('PGSQL_PORT', '5432')
+PGSQL_PORT = os.environ.get('PGSQL_PORT', '5434')
 PGSQL_USER = os.environ.get('PGSQL_USER', 'admin')
 PGSQL_PASSWD = os.environ.get('PGSQL_PASSWD','pexco599')
 PGSQL_BD = os.environ.get('PGSQL_BD', 'bd_apiqlik')
