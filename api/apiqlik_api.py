@@ -37,7 +37,7 @@ import json
 from flask import Flask, request, jsonify,  Response
 from flask_restful import Resource, Api, reqparse
 from flask_httpauth import HTTPBasicAuth
-from sqlalchemy import select, bindparam, update, Text, and_
+from sqlalchemy import select, delete, bindparam, update, Text, and_
 from sqlalchemy.dialects.postgresql import insert
 import datetime as dt
 from base_datos import Bd
@@ -75,7 +75,7 @@ class Control_acceso:
 
     def read_user(self, username):
         '''
-        Lee de la bd:control_acceso los datos del ususario 'username'
+        Lee de la bd:tb_clientes los datos del ususario 'username'
         Lee toda la tupla del registro (id,username,passwd,last_row)
         Retorna la primer tupla ( debería ser la unica )o None
         '''
@@ -255,13 +255,14 @@ class Utils:
                 l_last_data_ids.append( (dlgid, last_data_id) )
         return l_last_data_ids
 
-    def read_data(self, l_last_data_ids ):
+    def read_data(self, dlgid, last_data_id, maxlines ):
         '''
-        Recibe una lista de tuplas (dlgid/last_data_id) y lee los datos
-        Devuelve una lista de tuplas (dlgid, lasta)
+        Recibe una tupla (dlgid_id/last_data_id) y lee los datos desde el last_data_id
+        hasta el final o maxlines.
+        Devuelve una tupla con una lista con los datos
         '''
         if not self.bd.connect():
-            print(f"ApiQlik ERROR [bd_read_dlgids] no puedo conectarme a la BD.")
+            print(f"ApiQlik ERROR [read_data] no puedo conectarme a la BD.")
             return None
         #
         sel  = select( self.tables.tb_datos ).where(
@@ -269,7 +270,7 @@ class Utils:
                 self.tables.tb_datos.c.id > bindparam('last_data_id'),
                 self.tables.tb_datos.c.dlgid == bindparam('dlgid')
             )
-        ).limit(MAX_LINES)
+        ).limit(maxlines)
         if not self.bd.connect():
             print(f"ApiQlik ERROR [read_data] no puedo conectarme a la BD.")
             return None
@@ -277,26 +278,57 @@ class Utils:
         '''
         Armo una lista con tuplas donde c/u tiene el dlgid y el iterable con los resultados
         '''
-        l_qres = []
-        for t in l_last_data_ids:
-            dlgid = t[0]
-            last_data_id = t[1]
-            try:
-                rp = self.bd.conn.execute(sel,{'dlgid':dlgid, 'last_data_id': last_data_id})
-            except Exception as ex:
-                print(f'ApiQlik ERROR [DownloadDlgid] DATA EXCEPTION: {ex}')
-                self.bd.close()
-                return None
-              
-            l_qres.append( (dlgid, rp.fetchall()))
+        try:
+            rp = self.bd.conn.execute(sel,{'dlgid':dlgid, 'last_data_id': last_data_id})
+        except Exception as ex:
+            print(f'ApiQlik ERROR [DownloadDlgid] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return None
         #
+        data_lines = rp.fetchall()
         self.bd.close()
-        return l_qres
+        return data_lines
     
     def update_last_ids(self, d_last_id):
         for dlgid, last_data_id in d_last_id.items():
             self.update_last_id(dlgid, last_data_id)
 
+    def reset_control_download(self, l_dlgids):
+        '''
+        Recibe una lista de dlgid_id y para el usuario dado, borra las 
+        entradas de la tabla tb_control_download
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [reset_control_download] no puedo conectarme a la BD.")
+            return None
+        #
+        scalar_subq_user_id = (
+            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        ).scalar_subquery()
+        
+        scalar_subq_dlgid_id = (
+            select(self.tables.tb_equipos_validos.c.id).where ( self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"))
+        ).scalar_subquery()    
+        
+        delstmt = delete( self.tables.tb_control_download).where(
+            and_(
+                self.tables.tb_control_download.c.cliente_id == scalar_subq_user_id,
+                self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid_id
+            )
+        )
+
+        for dlgid in l_dlgids:
+            try:
+                _ = self.bd.conn.execute(delstmt,{'username':auth.current_user(), 'dlgid':dlgid })    
+            except Exception as ex:
+                print(f'ApiQlik ERROR [reset_control_download] DATA EXCEPTION: {ex}')
+                self.bd.rollback()
+                self.bd.close()
+                return False
+        
+        self.bd.conn.commit()
+        self.bd.close()
+        return True
 
 class Ping(Resource):
     '''
@@ -313,15 +345,14 @@ class Dlgids(Resource, Utils):
     Lee la lista de dlgid validos de la BD y la devuelve
     '''
     def __init__(self):
-        self.bd = Bd()
-        self.tables = scm
+        Utils.__init__(self)
 
     @auth.login_required
     def get(self):
         '''
         Lee la lista de dlgid validos y la envia en una respuesta
         '''
-        l_dlgids = Utils.read_dlgids(self)
+        l_dlgids = self.read_dlgids()
         if l_dlgids is None:
             return {'status':'ERR', 'rsp':'ERROR Conexion a BD'}, 404
             
@@ -344,7 +375,7 @@ class Dlgids(Resource, Utils):
         dlgid = args.get('dlgid','')
 
         # Leemos la lista para ver que ya no exista
-        l_dlgids = Utils.read_dlgids(self)
+        l_dlgids = self.read_dlgids()
         if l_dlgids is None:
             return {'status':'ERR', 'rsp':'ERROR access BD.'}, 406
         
@@ -353,7 +384,7 @@ class Dlgids(Resource, Utils):
             return {'status':'OK' }, 200
 
         # Lo inserto. No controlo errores
-        _ = Utils.insert_dlgid(self, dlgid)
+        _ = self.insert_dlgid(dlgid)
         return {'status':'OK' }, 200
 
 class Help(Resource):
@@ -371,7 +402,8 @@ class Help(Resource):
             'PUT /apiqlik/dlgids':'Agrega un nuevo dlgid al sistema',
             'GET /apiqlik/download_data':'Devuelve todos los datos',
             'GET /apiqlik/download_dlgid':'Permite seleccionar dlgid',
-            'GET /apiqlik/download_dlgid_list':'Baja los datos de una lista de dlgids',
+            'POST /apiqlik/download_dlgid_list':'Baja los datos de una lista de dlgids',
+            'POST /apiqlik/rollback':'Borra los datos de una lista de dlgids',
         }
         return d_options, 200
 
@@ -521,7 +553,7 @@ class DownloadDlgid(Resource, Utils):
         '''
         Buscamos / creamos registro con ultimo id
         '''
-        last_data_id = Utils.get_last_data_id(self, dlgid)
+        last_data_id = self.get_last_data_id (dlgid)
         #last_data_id = self.get_last_data_id(dlgid)
         if last_data_id is None:
             print(f"ApiQlik ERROR [DownloadDlgid] no puedo inicializar la BD.")
@@ -575,8 +607,7 @@ class DownloadDlgidList(Resource, Utils):
     que recibo por POST
     '''
     def __init__(self):
-        self.bd = Bd()
-        self.tables = scm
+        Utils.__init__(self)
 
     @auth.login_required
     def post(self):
@@ -585,55 +616,57 @@ class DownloadDlgidList(Resource, Utils):
         '''
         # Extraigo los datos del json ( es un diccionario serializado json)
         params = request.get_json()
+        maxlines = int(params.get('maxlines',MAX_LINES))
         l_dlgids = params.get('l_dlgid',[])
         '''
         Paso 1: Selecciono los last_data_id para c/dlgid de l_dlgid.
                 Dejo en una lista tuplas (dlgid, last_data_id)
+                Ej: l_last_data_ids = [('DNOPERF25', 87), ('DNOPERF03', 104)]
         '''
-        l_last_data_ids = Utils.get_last_data_ids(self, l_dlgids)
+        l_last_data_ids = self.get_last_data_ids(l_dlgids)
         if l_last_data_ids is None:
             return {'status':'ERR', 'code': 404, 'rsp':'ERROR get_last_data_ids'}
     
-        #print(f'DEBUG::DownloadDlgidList l_last_data_ids = {l_last_data_ids}' )
+        print(f'DEBUG::maxlines = {maxlines}' )
+        print(f'DEBUG::DownloadDlgidList l_last_data_ids = {l_last_data_ids}' )
         '''
-        Paso 2: Leo los datos de todos los dlgid de la l_dlgid y devulevo una lista 
-        con tuplas de 3 elementos: dlgid/last_data_id/data_iterable
+        Paso 2: Para c/elemento de la lista leo todos los datos que hayan hasta maxlines
+                y devuelvo una lista de las data_lines[]
         '''
-        l_qres = Utils.read_data(self, l_last_data_ids)
-        if l_qres is None:
-            return {'status':'ERR','rsp':'ERROR read_data'}, 404
-        
-        #print(f'DEBUG::DownloadDlgidList l_qres = {l_qres}' )
-        '''
-        Genero el csv con los datos de todos los dlgids
-        Cada elemento de la l_qres es una tupla que tiene (dlgid, [lista de lineas de datos])
-        '''
-        l_zip_data = []
-        for (id, l_data) in l_qres:
-            l_zip_data.append(l_data)
-
-        #print(f'DEBUG::DownloadDlgidList l_zip_data = {l_zip_data}')
-
-        # uso el * para unpack ya que no tengo la cantidad de listas
         csv_data = ""
         d_last_id = {}
-        nro_lines = 0
-        for tdata in zip(*l_zip_data):
-            for rcd in tdata:
+        csv_idx = 0
+
+        for (dlgid, last_data_id) in l_last_data_ids:
+            # Leo las lineas de c/dlgid
+            data_lines = self.read_data(dlgid, last_data_id, maxlines)
+            if data_lines is None:
+                # No hay datos para ese datalogger
+                next
+            # Las voy agregando al csv
+            csv_full = False
+            for rcd in data_lines:
                 (id,fechasys,fechadata,dlgid,tag,value) = rcd
                 line = f'{id},{fechasys},{fechadata},{dlgid},{tag},{value}\n'
                 csv_data += line
                 d_last_id[dlgid] = int(id)
-                nro_lines += 1
-            if nro_lines > MAX_LINES:
+                csv_idx += 1
+                # Controlo no sobrepasar el tamaño pedido del csv
+                #if csv_idx > MAX_LINES:
+                if csv_idx > maxlines:
+                    csv_full = True
+                    break
+
+            # Si llene el csv, salgo a enviarlo
+            if csv_full is True:
                 break
 
         #print(f'DEBUG::DownloadDlgidList csv_data = {csv_data}')
-        #print(f'DEBUG::DownloadDlgidList d_last_id = {d_last_id}')
+        print(f'DEBUG::DownloadDlgidList d_last_id = {d_last_id}')
         '''
         Paso 3: Actualizo la tabla de control_download
         '''
-        _ = Utils.update_last_ids(self, d_last_id)
+        _ = self.update_last_ids(d_last_id)
 
         # Retorno los datos
         self.bd.close()
@@ -666,6 +699,32 @@ class Housekeeping(Resource):
 
         return {'status':'OK', 'rsp':'NO ACTION'}, 200  
 
+class Rollback(Resource, Utils):
+    ''' 
+    Devuelve hasta 5000 registros en modo csv de todos los dataloggers de una lista
+    que recibo por POST
+    '''
+    def __init__(self):
+        Utils.__init__(self)
+
+    @auth.login_required
+    def post(self):
+        '''
+        Recibo un JSON con una lista de dataloggers.
+        '''
+        # Extraigo los datos del json ( es un diccionario serializado json)
+        params = request.get_json()
+        l_dlgids = params.get('l_dlgid',[])
+        '''
+        Paso 1: Selecciono los last_data_id para c/dlgid de l_dlgid.
+                Dejo en una lista tuplas (dlgid, last_data_id)
+        '''
+        if not self.reset_control_download(l_dlgids):
+            return {'status':'ERR', 'code': 404, 'rsp':'ERROR Rollback'}
+        
+        return {'status':'OK'}, 200 
+
+
      
 api.add_resource( Ping, '/apiqlik/ping')
 api.add_resource( Help, '/apiqlik/help')
@@ -674,13 +733,15 @@ api.add_resource( Download, '/apiqlik/download')
 api.add_resource( DownloadDlgid, '/apiqlik/download_dlgid')
 api.add_resource( DownloadDlgidList, '/apiqlik/download_dlgid_list')
 api.add_resource( Read, '/apiqlik/read')
+api.add_resource( Rollback, '/apiqlik/rollback')
+
 #api.add_resource( Housekeeping, '/apiqlik/housekeeping')
 
 if __name__ != '__main__':
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    app.logger.info( f'Starting APIQLIK, MAX_LINES={MAX_LINES}' )
+    app.logger.info( f'Starting APIQLIK' )
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5022, debug=True)
