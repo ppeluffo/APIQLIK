@@ -1,5 +1,13 @@
 #!/home/pablo/Spymovil/python/proyectos/APIQLIK/venv/bin/python3
 """
+import sys
+sys.path.insert(0,'bdatos/')
+sys.path.insert(0,'../bdatos/')
+from base_datos import Bd
+import schemas as scm
+bd=Bd()
+conn = bd.connect()
+scm.metadata.create_all(bd.get_engine())
 """
 
 import os

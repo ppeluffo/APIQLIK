@@ -57,10 +57,11 @@ import datetime as dt
 from base_datos import Bd
 import schemas as scm
 
-#MAX_LINES = int(os.environ.get('MAX_LINES','10000'))
-MAX_LINES = int(os.environ.get('MAX_LINES','10'))
+MAX_LINES = int(os.environ.get('MAX_LINES','10000'))
+#MAX_LINES = int(os.environ.get('MAX_LINES','10'))
+HOUSEKEEPING = os.environ.get('HOUSEKEEPING','TRUE')
 
-API_VERSION = 'R002 @ 2024-10-22'
+API_VERSION = 'R002 @ 2024-12-05'
 
 app = Flask(__name__)
 api = Api(app)
@@ -94,7 +95,7 @@ class Control_acceso:
         Lee toda la tupla del registro (id,username,passwd,last_row)
         Retorna la primer tupla ( debería ser la unica )o None
         '''
-        sel = select(self.tables.tb_clientes).where(self.tables.tb_clientes.c.username == bindparam('username'))
+        sel = select(self.tables.tb_usuarios).where(self.tables.tb_usuarios.c.username == bindparam('username'))
         if not self.bd.connect():
             print(f"ApiQlik ERROR [Control_acceso] no puedo conectarme a la BD.")
             return None
@@ -113,90 +114,234 @@ class Utils:
     def __init__(self):
         self.bd = Bd()
         self.tables = scm
-        
-    def get_last_data_id(self, dlgid):
-        """
-        Busca si hay algún registro en la BD:tb_control_download con la tupla username_id/equipo_id.
-        Si la hay, retorna el valor de last_data_id.
-        Si no la hay, tenemos que inicializar creando un registro con el last_data_id = 0 y también
-        retornarlo.
-        Return:
-        None: en caso de error
-        Int: id.
-        """
-
-        #print(f"DEBUG: dlgid={dlgid}, username={auth.current_user()}")
-              
-        scalar_subq_cliente_id = (
-            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
-        ).scalar_subquery()
-
-        scalar_subq_dlgid = (
-            select(self.tables.tb_equipos_validos.c.id).where ( 
-                and_(
-                    self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"),
-                    self.tables.tb_equipos_validos.c.cliente_id == scalar_subq_cliente_id
-                )
-            )
-        ).scalar_subquery()
-
-        sel = select(self.tables.tb_control_download.c.last_data_id).where(
-                and_(
-                    self.tables.tb_control_download.c.cliente_id == scalar_subq_cliente_id,
-                    self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid
-                )
-            )
-        #
+ 
+    def create_dlgid(self, dlgid):
+        '''
+        Crea una entrada nueva en la tabla de equipos.
+        Si existe el dlgid, no hace nada
+        '''
         if not self.bd.connect():
-            print(f"ApiQlik ERROR [get_last_data_id] no puedo conectarme a la BD.")
-            return None
-        #
+            print(f"ApiQlik ERROR [create_dlgid] no puedo conectarme a la BD.")
+            return False
+        
+        ins  = insert( self.tables.tb_equipos ).values(dlgid = bindparam('dlgid')).on_conflict_do_nothing()
         try:
-            rp = self.bd.conn.execute(sel,{'username': auth.current_user(), 'dlgid':dlgid })
+            res = self.bd.conn.execute( ins, { 'dlgid':dlgid } )
         except Exception as ex:
-            print(f'ApiQlik ERROR [get_last_data_id] DATA EXCEPTION: {ex}')
+            print(f'ApiQlik ERROR [create_dlgid] DATA EXCEPTION: {ex}')
             self.bd.close()
-            return None           
+            return False
 
-        res = rp.fetchone()
-        #print(f'DEBUG1::get_last_data_id: dlgid={dlgid}, res={res}')
-        if res is None:
-            """
-            No hay registro
-            Debo inicializar el registro username,dlgid,row
-            """
-            print(f"El equipo {dlgid} no esta inicializado o no pertence al usuario {auth.current_user()}")
+        self.bd.commit()
+        self.bd.close()
+        try:
+            pk = res.inserted_primary_key[0]
+        except:
+            # No hizo nada la consulta, posiblemente por 'on_conflict'
+            pk = None
+        
+        return pk  
+
+    def create_nodo(self, dlgid):
+        '''
+        Creamos un nodo entre el dlgid y el usuario.
+        Si ya existe ignoramos el error.
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [create_nodo] no puedo conectarme a la BD.")
+            return False
+        
+        # Subquery para obtener el user_id del username.
+        scalar_subq_user_id = (
+            select(self.tables.tb_usuarios.c.id).where ( self.tables.tb_usuarios.c.username == bindparam("username"))
+        ).scalar_subquery()
+        #
+        # Subquery para obtener el equipo_id del dlg.
+        scalar_subq_equipo_id = (
+            select(self.tables.tb_equipos.c.id).where ( self.tables.tb_equipos.c.dlgid == bindparam("dlgid"))
+        ).scalar_subquery()
+        #
+        ins  = insert( self.tables.tb_nodos ).values( equipo_id = scalar_subq_equipo_id, user_id = scalar_subq_user_id ).on_conflict_do_nothing()
+        try:
+            res = self.bd.conn.execute( ins, { 'dlgid':dlgid, 'username':auth.current_user()} )
+        except Exception as ex:
+            print(f'ApiQlik ERROR [create_nodo] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return False
+
+        self.bd.commit()
+        self.bd.close()
+        try:
+            pk = res.inserted_primary_key[0]
+        except:
+            # No hizo nada la consulta, posiblemente por 'on_conflict'
+            pk = None
+        
+        return pk   
+
+    def create_control_download_entry(self, nodo_id):
+        '''
+        Creo una nueva entrada en la tabla control_download, con el valor
+        de last_data_id inicializado en 0.
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [create_control_download_entry] no puedo conectarme a la BD.")
+            return False
+        #
+        ins  = insert( self.tables.tb_control_download ).values(nodo_id = bindparam('nodo_id')).on_conflict_do_nothing()
+        try:
+            res = self.bd.conn.execute( ins, { 'nodo_id':nodo_id } )
+        except Exception as ex:
+            print(f'ApiQlik ERROR [create_control_download_entry] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return False
+
+        self.bd.commit()
+        self.bd.close()
+        try:
+            pk = res.inserted_primary_key[0]
+        except:
+            # No hizo nada la consulta, posiblemente por 'on_conflict'
+            pk = None
+        
+        return pk  
+
+    def read_nodos(self):
+        '''
+        Lee todos los nodos que tiene un usuario dado y genera una lista
+        de tuplas (nodo_id, dlg_id, dlgid) que retorna
+
+        SELECT (nodos.id, equipo_id, dlgid) 
+        FROM nodos, equipos 
+        WHERE nodos.equipo_id = equipos.id 
+        AND user_id = ( SELECT (id) FROM usuarios WHERE username = '?')
+
+        print(sel)
+        SELECT nodos.id, nodos.equipo_id, equipos.dlgid 
+        FROM nodos, equipos 
+        WHERE nodos.equipo_id = equipos.id 
+        AND nodos.user_id = (SELECT usuarios.id FROM usuarios WHERE usuarios.username = :username)
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [read_nodos] no puedo conectarme a la BD.")
+            return False
+
+        # Subquery para obtener el user_id del username.
+        scalar_subq_user_id = (
+            select(self.tables.tb_usuarios.c.id).where ( self.tables.tb_usuarios.c.username == bindparam("username"))
+        ).scalar_subquery()
+        #
+        sel = select(self.tables.tb_nodos.c.id, self.tables.tb_nodos.c.equipo_id, self.tables.tb_equipos.c.dlgid).where(
+                and_(
+                    self.tables.tb_nodos.c.equipo_id == self.tables.tb_equipos.c.id, 
+                    self.tables.tb_nodos.c.user_id == scalar_subq_user_id
+                )
+            )
+        # Armo una lista con tuplas donde c/u tiene el dlgid y el iterable con los resultados
+        try:
+            rp = self.bd.conn.execute(sel,{'username':auth.current_user() })
+        except Exception as ex:
+            print(f'ApiQlik ERROR [read_nodos] DATA EXCEPTION: {ex}')
             self.bd.close()
             return None
         #
-        return res[0]
-    
+        res = rp.fetchall()
+        self.bd.close()
+        return res
+
+    def read_data(self, dlgid, maxlines=MAX_LINES):
+        '''
+        Lee los datos desde el last_data_id
+        hasta el final o maxlines de un nodo dado (dlgid, userid)
+        Devuelve una tupla con una lista con los datos
+        Actualizo en control_download el last_data_id para el nodo dado
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [read_data] no puedo conectarme a la BD.")
+            return None
+        #
+        # Subquery para obtener el user_id del username.
+        scalar_subq_user_id = (
+            select(self.tables.tb_usuarios.c.id).where ( self.tables.tb_usuarios.c.username == bindparam("username"))
+        ).scalar_subquery()
+        #        
+        # Subquery para obtener el equipo_id del dlg.
+        scalar_subq_equipo_id = (
+            select(self.tables.tb_equipos.c.id).where ( self.tables.tb_equipos.c.dlgid == bindparam("dlgid_1"))
+        ).scalar_subquery()
+        #
+        # Subquery para obtener el nodo_id para el (user_id, equipo_id).
+        scalar_subq_nodo_id = (
+            select(self.tables.tb_nodos.c.id).where(
+                and_(
+                    self.tables.tb_nodos.c.equipo_id == scalar_subq_equipo_id, 
+                    self.tables.tb_nodos.c.user_id == scalar_subq_user_id
+                )
+            )
+        ).scalar_subquery()
+        #
+        # Subquery para obtener el last_data_id para el nodo (username, dlgid).
+        scalar_subq_last_data_id = (
+            select(self.tables.tb_control_download.c.last_data_id).where ( self.tables.tb_control_download.c.nodo_id == scalar_subq_nodo_id )
+        ).scalar_subquery()
+        #
+        # Query para leer los datos de un datalogger dado de un nodo, a partir del last_data_id del nodo
+        sel  = select( self.tables.tb_datos ).where(
+            and_(
+                self.tables.tb_datos.c.id > scalar_subq_last_data_id,
+                self.tables.tb_datos.c.dlgid == bindparam('dlgid_2')
+            )
+        ).limit(maxlines)
+        #
+        '''
+        Armo una lista con tuplas donde c/u tiene el dlgid y el iterable con los resultados
+        '''
+        try:
+            rp = self.bd.conn.execute(sel,{'username':auth.current_user(), 'dlgid_1':dlgid, 'dlgid_2':dlgid})
+        except Exception as ex:
+            print(f'ApiQlik ERROR [read_data] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return None
+        #
+        data_lines = rp.fetchall()
+        self.bd.close()
+        return data_lines
+
     def update_last_id(self, dlgid, last_data_id):
         '''
-        Actualizamos el registro de la tupla username_id/dlgid_id con el valor del 
-        la ultima linea entregada (last_data_id)
+        Actualizamos el registro del control_download que corresponde al nodo dado
         '''
         if not self.bd.connect():
             print(f"ApiQlik ERROR [update_last_id] no puedo conectarme a la BD.")
             return None
-    
-        scalar_subq_username = (
-            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        
+        # Subquery para obtener el user_id del username.
+        scalar_subq_user_id = (
+            select(self.tables.tb_usuarios.c.id).where ( self.tables.tb_usuarios.c.username == bindparam("username"))
         ).scalar_subquery()
-
-        scalar_subq_dlgid = (
-            select(self.tables.tb_equipos_validos.c.id).where ( self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"))
+        #        
+        # Subquery para obtener el equipo_id del dlg.
+        scalar_subq_equipo_id = (
+            select(self.tables.tb_equipos.c.id).where ( self.tables.tb_equipos.c.dlgid == bindparam("dlgid"))
         ).scalar_subquery()
-
-        upd = update(self.tables.tb_control_download).where(
+        #
+        # Subquery para obtener el nodo_id para el (user_id, equipo_id).
+        scalar_subq_nodo_id = (
+            select(self.tables.tb_nodos.c.id).where(
                 and_(
-                    self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid,
-                    self.tables.tb_control_download.c.cliente_id == scalar_subq_username,
+                    self.tables.tb_nodos.c.equipo_id == scalar_subq_equipo_id, 
+                    self.tables.tb_nodos.c.user_id == scalar_subq_user_id
                 )
+            )
+        ).scalar_subquery()
+        #
+        # Update query para actualizar el last_data_id
+        upd = update(self.tables.tb_control_download).where( self.tables.tb_control_download.c.nodo_id == scalar_subq_nodo_id
             ).values( last_data_id=bindparam("last_data_id") )
-            
+
         try:
-            _ = self.bd.conn.execute(upd,{'username':auth.current_user(), 'dlgid':dlgid, 'last_data_id':last_data_id})    
+            _ = self.bd.conn.execute(upd,{'username':auth.current_user(), 'dlgid':dlgid, 'last_data_id':last_data_id})   
+
         except Exception as ex:
             print(f'ApiQlik ERROR [update_last_id] DATA EXCEPTION: {ex}')
             self.bd.rollback()
@@ -206,157 +351,7 @@ class Utils:
         self.bd.conn.commit()
         self.bd.close()
         return True
-    
-    def read_dlgids(self):
-        '''
-        Funcion que propiamente lee la lista de la BD perteneciente al usuario logueado
-        Modificacion 2024-11-28: 
-        En la consulta usamos el username de modo que las listas de dlgid son de
-        cada usuario
-        '''
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [bd_read_dlgids] no puedo conectarme a la BD.")
-            return None
-        #
-        scalar_subq_cliente_id = (
-            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
-        ).scalar_subquery()
-        #
-        sel  = select( self.tables.tb_equipos_validos.c.dlgid ).where( 
-            self.tables.tb_equipos_validos.c.cliente_id == scalar_subq_cliente_id 
-            )
-        #
-        try:
-            rp = self.bd.conn.execute( sel, {'username':auth.current_user()})    
-        except Exception as ex:
-            print(f'ApiQlik ERROR [bd_read_dlgids] DATA EXCEPTION: {ex}')
-            self.bd.close()
-            return None
 
-        l_dlgids = []
-        for t in rp.fetchall():
-            l_dlgids.append(t[0])
-
-        self.bd.close()
-        return l_dlgids
-    
-    def insert_dlgid(self, dlgid):
-        '''
-        Funcion que inserta el dlgid en la BD
-        Modificacion 2024-11-28:
-        Agregamos como parámetro el cliente_id de modo que las listas sean pesonificadas.
-        '''
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [bd_insert_dlgid] no puedo conectarme a la BD.")
-            return False
-        #
-        scalar_subq_cliente_id = (
-            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
-        ).scalar_subquery()
-            
-        ins  = insert( self.tables.tb_equipos_validos ).values(dlgid = bindparam('dlgid'), cliente_id = scalar_subq_cliente_id )
-        try:
-            rp = self.bd.conn.execute( ins, { 'dlgid':dlgid, 'username':auth.current_user() } )
-        except Exception as ex:
-            print(f'ApiQlik ERROR [bd_insert_dlgid] DATA EXCEPTION: {ex}')
-            self.bd.close()
-            return False
-
-        self.bd.commit()
-        self.bd.close()
-        return True
-
-    def get_last_data_ids(self, l_dlgids):
-        '''
-        Toma una lista de dlgids y retorna una lista con tuplas (dlgid/last_data_id)
-        '''
-        l_last_data_ids = []
-        for dlgid in l_dlgids:
-            last_data_id = self.get_last_data_id(dlgid)
-            if last_data_id is None:
-                print(f"ApiQlik ERROR [get_last_data_ids] no puedo inicializar la BD.")
-                return None
-            else:
-                l_last_data_ids.append( (dlgid, last_data_id) )
-        return l_last_data_ids
-
-    def read_data(self, dlgid, last_data_id, maxlines ):
-        '''
-        Recibe una tupla (dlgid_id/last_data_id) y lee los datos desde el last_data_id
-        hasta el final o maxlines.
-        Devuelve una tupla con una lista con los datos
-
-        '''
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [read_data] no puedo conectarme a la BD.")
-            return None
-        #
-        sel  = select( self.tables.tb_datos ).where(
-            and_(
-                self.tables.tb_datos.c.id > bindparam('last_data_id'),
-                self.tables.tb_datos.c.dlgid == bindparam('dlgid')
-            )
-        ).limit(maxlines)
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [read_data] no puedo conectarme a la BD.")
-            return None
-        #
-        '''
-        Armo una lista con tuplas donde c/u tiene el dlgid y el iterable con los resultados
-        '''
-        try:
-            rp = self.bd.conn.execute(sel,{'dlgid':dlgid, 'last_data_id': last_data_id})
-        except Exception as ex:
-            print(f'ApiQlik ERROR [DownloadDlgid] DATA EXCEPTION: {ex}')
-            self.bd.close()
-            return None
-        #
-        data_lines = rp.fetchall()
-        self.bd.close()
-        return data_lines
-  
-    def update_last_ids(self, d_last_id):
-        for dlgid, last_data_id in d_last_id.items():
-            self.update_last_id(dlgid, last_data_id)
-
-    def reset_control_download(self, l_dlgids):
-        '''
-        Recibe una lista de dlgid_id y para el usuario dado, borra las 
-        entradas de la tabla tb_control_download
-        '''
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [reset_control_download] no puedo conectarme a la BD.")
-            return None
-        #
-        scalar_subq_user_id = (
-            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
-        ).scalar_subquery()
-        
-        scalar_subq_dlgid_id = (
-            select(self.tables.tb_equipos_validos.c.id).where ( self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"))
-        ).scalar_subquery()    
-        
-        delstmt = delete( self.tables.tb_control_download).where(
-            and_(
-                self.tables.tb_control_download.c.cliente_id == scalar_subq_user_id,
-                self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid_id
-            )
-        )
-
-        for dlgid in l_dlgids:
-            try:
-                _ = self.bd.conn.execute(delstmt,{'username':auth.current_user(), 'dlgid':dlgid })    
-            except Exception as ex:
-                print(f'ApiQlik ERROR [reset_control_download] DATA EXCEPTION: {ex}')
-                self.bd.rollback()
-                self.bd.close()
-                return False
-        
-        self.bd.conn.commit()
-        self.bd.close()
-        return True
-
-#------------------------------------------------------------------------------
 class Ping(Resource):
     '''
     Prueba la conexion a la SQL
@@ -399,17 +394,19 @@ class Dlgids(Resource, Utils):
         '''
         Lee la lista de dlgid validos y la envia en una respuesta
         '''
-        l_dlgids = self.read_dlgids()
-        if l_dlgids is None:
-            return {'status':'ERR', 'rsp':'ERROR Conexion a BD'}, 404
+        # Tupla de nodos ( nodo_id, dlg_id, dlgid )
+        l_nodos = self.read_nodos()
+        l_dlgids = [ dlgid for _, _, dlgid in l_nodos ]
             
         return {'status':'OK','rsp': l_dlgids }, 200
 
     @auth.login_required
     def put(self):
         '''
-        Recibe el parámetro REQUERIDO dlgid.
-        Lee la lista de dlgid validos: si ya está no hace nada y sino lo inserta
+        Recibe el dlgid como parámetro REQUERIDO.
+        Trata de insertarlo en la tabla de 'equipos'
+        Trata de crear el nodo en la tabla 'nodos'
+        Si en alguno ya existe ignoramos el error.
         '''
         parser = reqparse.RequestParser()
         parser.add_argument('dlgid',type=str,location='args',required=True)
@@ -421,17 +418,16 @@ class Dlgids(Resource, Utils):
         
         dlgid = args.get('dlgid','')
 
-        # Leemos la lista para ver que ya no exista
-        l_dlgids = self.read_dlgids()
-        if l_dlgids is None:
-            return {'status':'ERR', 'rsp':'ERROR access BD.'}, 406
-        
-        if dlgid in l_dlgids:
-            # Ya existe
-            return {'status':'OK' }, 200
+        # Paso 1: Creamos el dlgid en la tabla de equipos
+        _ = self.create_dlgid(dlgid)
 
-        # Lo inserto. No controlo errores
-        _ = self.insert_dlgid(dlgid)
+        # Paso 2: Creamos el nodo
+        nodo_id = self.create_nodo(dlgid)
+
+        # Paso 3: Creo una nueva entrada en control_download
+        if nodo_id is not None:
+            _ = self.create_control_download_entry(nodo_id)
+
         return {'status':'OK' }, 200
 
 class DownloadDlgid(Resource, Utils):
@@ -439,8 +435,7 @@ class DownloadDlgid(Resource, Utils):
     Devuelve hasta 5000 registros en modo csv de un dataloggers dado
     '''
     def __init__(self):
-        self.bd = Bd()
-        self.tables = scm
+        Utils.__init__(self)
     
     @auth.login_required
     def get(self):
@@ -449,89 +444,66 @@ class DownloadDlgid(Resource, Utils):
         Este indica para c/usuario que consulta, cual fue la ultima linea que se le dió y sirve
         para enviar de esta en adelante.
         Solo se dan los datos de un dlgid dado
+        SELECT FROM tb_datos WHERE tb_datos.dlgid = ?
+        AND tb_datos.id > ( SELECT last_data_id FROM tb_control_download WHERE nodo_id = 
 
+        
+        Selecciono los datos para el nodo dado a partir del ultimo last_data_id.
+        Actualizo para el nodo dado el last_data_id.
+    
         '''
         parser = reqparse.RequestParser()
         parser.add_argument('dlgid',type=str,location='args',required=True)
         args=parser.parse_args()
         dlgid = args['dlgid']
-        #print(f'DEBUG::DownloadDlgid dlgid={dlgid}')
         '''
         Buscamos / creamos registro con ultimo id para el usuario dado
         '''
-        last_data_id = self.get_last_data_id (dlgid)
-        if last_data_id is None:
-            print(f"ApiQlik ERROR [DownloadDlgid].")
-            return {'status':'ERR','rsp':'dlgid/BD/inicializacion ERROR'}, 404
-        #           
-        #print(f'DEBUG::DownloadDlgid last_data_id={last_data_id}')
-        '''
-        Leo ahora los datos para el dlgid a partir del last_data_id del usuario dado
-        '''
-        sel  = select( self.tables.tb_datos ).where(
-            and_(
-                self.tables.tb_datos.c.id > bindparam('last_data_id'),
-                self.tables.tb_datos.c.dlgid == bindparam('dlgid')
-            )
-        ).limit(MAX_LINES)
-        
-        if not self.bd.connect():
-            print(f"ApiQlik ERROR [DownloadDlgid] no puedo conectarme a la BD.")
-            return {'status':'ERR','rsp':'ERROR Conexion a BD'}, 404
-        #
-        try:
-            rp = self.bd.conn.execute(sel,{'dlgid':dlgid, 'last_data_id': last_data_id})
-        except Exception as ex:
-            print(f'ApiQlik ERROR [DownloadDlgid] DATA EXCEPTION: {ex}')
-            self.bd.close()
-            return {'status':'ERR', 'rsp':'ERROR BD select'}, 404            
-        #
-        # Las consultas siempre devuelven un result_proxy
+        l_data = self.read_data(dlgid)
         nro_lines = 0
+        last_data_id = 0
         csv_data = ""
-        for rcd in rp.fetchall():
+        for rcd in l_data:
             (id,fechasys,fechadata,dlgid,tag,value) = rcd
             line = f'{id},{fechasys},{fechadata},{dlgid},{tag},{value}\n'
             csv_data += line
             nro_lines += 1
             last_data_id = id
         #
-        #print(f"DEBUG::DownloadDlgid Last Row=last_data_id}")
+        #print(f"DEBUG::DownloadDlgid Last Row={last_data_id}")
         #
         # Actualizo el ultimo registro en Control_acceso para el dlgid y el usuario dado
         if nro_lines > 0:
             #self.update_last_id(dlgid, last_data_id) 
-            Utils.update_last_id(self, dlgid, last_data_id) 
+            self.update_last_id(dlgid, last_data_id) 
         #
-        self.bd.close()
         response = Response(csv_data, content_type="text/csv")
         response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
         return response
 
-class Housekeeping(Resource):
+class Rollback(Resource, Utils):
     ''' 
-    Clase oculta para realizar tareas de mantenimiento
-    La tabla clientes no la puedo crear !!! ya que la uso para autentificarme
+    Pone el last_data_id del nodo correspondiente en 0
+    Recibe una lista de dlgids.
     '''
     def __init__(self):
-        self.bd = Bd()
-        self.tables = scm
-        
+        Utils.__init__(self)
+
     @auth.login_required
-    def get(self):
+    def post(self):
         '''
+        Recibo un JSON con una lista de dataloggers.
+        Para c/u, determino su nodo y pongo el last_data_id de la tabla control_download en 0.
         '''
-        parser = reqparse.RequestParser()
-        parser.add_argument('action',type=str,location='args',required=True)
-        args=parser.parse_args()
-        action = args['action']
+        # Extraigo los datos del json ( es un diccionario serializado json)
+        params = request.get_json()
+        l_dlgids = params.get('l_dlgid',[])
+        
+        for dlgid in l_dlgids:
+            self.update_last_id(dlgid, 0)
 
-        if action == 'CREATE_DATABASES':
-            conn = self.bd.connect()
-            self.tables.metadata.create_all(self.bd.get_engine())
-            return {'status':'OK', 'rsp':'CREATE_DATABASES'}, 200   
-
-        return {'status':'OK', 'rsp':'NO ACTION'}, 200  
+        
+        return {'status':'OK'}, 200 
 
 class DownloadDlgidList(Resource, Utils):
     ''' 
@@ -544,68 +516,250 @@ class DownloadDlgidList(Resource, Utils):
     @auth.login_required
     def post(self):
         '''
-        Recibo un JSON con una lista de dataloggers.
+        Recibo un JSON el nro.de lineas que quiero en el CSV y una lista de dataloggers
+        Voy leyendo los nodos correspondientes y armando un csv hasta alcanzar el maxlines
+        y lo transmito.
         '''
         # Extraigo los datos del json ( es un diccionario serializado json)
         params = request.get_json()
         maxlines = int(params.get('maxlines',MAX_LINES))
         l_dlgids = params.get('l_dlgid',[])
-        '''
-        Paso 1: Selecciono los last_data_id para c/dlgid de l_dlgid.
-                Dejo en una lista tuplas (dlgid, last_data_id)
-                Ej: l_last_data_ids = [('DNOPERF25', 87), ('DNOPERF03', 104)]
-        '''
-        l_last_data_ids = self.get_last_data_ids(l_dlgids)
-        if l_last_data_ids is None:
-            return {'status':'ERR', 'code': 404, 'rsp':'ERROR get_last_data_ids'}
-    
-        print(f'DEBUG::maxlines = {maxlines}' )
-        print(f'DEBUG::DownloadDlgidList l_last_data_ids = {l_last_data_ids}' )
-        '''
-        Paso 2: Para c/elemento de la lista leo todos los datos que hayan hasta maxlines
-                y devuelvo una lista de las data_lines[]
-        '''
+
         csv_data = ""
-        d_last_id = {}
-        csv_idx = 0
-
-        for (dlgid, last_data_id) in l_last_data_ids:
-            # Leo las lineas de c/dlgid
-            data_lines = self.read_data(dlgid, last_data_id, maxlines)
-            if data_lines is None:
-                # No hay datos para ese datalogger
-                next
-            # Las voy agregando al csv
-            csv_full = False
-            for rcd in data_lines:
-                (id,fechasys,fechadata,dlgid,tag,value) = rcd
-                line = f'{id},{fechasys},{fechadata},{dlgid},{tag},{value}\n'
-                csv_data += line
-                d_last_id[dlgid] = int(id)
-                csv_idx += 1
-                # Controlo no sobrepasar el tamaño pedido del csv
-                #if csv_idx > MAX_LINES:
-                if csv_idx > maxlines:
-                    csv_full = True
-                    break
-
-            # Si llene el csv, salgo a enviarlo
-            if csv_full is True:
+        nro_lines_in_csv = 0
+        
+        for (dlgid) in l_dlgids:
+            read_lines = maxlines - nro_lines_in_csv
+            if read_lines > 0:
+                # Si queda espacio, sigo leyendo
+                l_data = self.read_data(dlgid, read_lines)
+                last_data_id = 0
+                for rcd in l_data:
+                    (id,fechasys,fechadata,dlgid,tag,value) = rcd
+                    line = f'{id},{fechasys},{fechadata},{dlgid},{tag},{value}\n'
+                    csv_data += line
+                    nro_lines_in_csv += 1
+                    last_data_id = id
+                #
+                # Actualizo el ultimo registro en Control_acceso para el dlgid y el usuario dado
+                self.update_last_id(dlgid, last_data_id) 
+            else:
+                # No queda mas espacio en el csv: salgo
                 break
 
-        #print(f'DEBUG::DownloadDlgidList csv_data = {csv_data}')
-        print(f'DEBUG::DownloadDlgidList d_last_id = {d_last_id}')
-        '''
-        Paso 3: Actualizo la tabla de control_download
-        '''
-        _ = self.update_last_ids(d_last_id)
-
         # Retorno los datos
-        self.bd.close()
         response = Response(csv_data, content_type="text/csv")
         response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
         return response
 
+class Housekeeping(Resource, Utils):
+    ''' 
+    Clase oculta para realizar tareas de mantenimiento
+    La tabla clientes no la puedo crear !!! ya que la uso para autentificarme
+    '''
+    def __init__(self):
+        Utils.__init__(self)
+        
+    @auth.login_required
+    def post(self):
+        '''
+        Creamos la lista de dlgids, nodos
+        '''
+        if HOUSEKEEPING == 'FALSE':
+            return {'status':'FAIL' }, 405 
+           
+        params = request.get_json()
+        l_dlgids = params.get('l_dlgid',[])
+        #
+        for dlgid in l_dlgids:
+            # Paso 1: Creamos el dlgid en la tabla de equipos
+            _ = self.create_dlgid(dlgid)
+
+            # Paso 2: Creamos el nodo
+            nodo_id = self.create_nodo(dlgid)
+
+            # Paso 3: Creo una nueva entrada en control_download
+            if nodo_id is not None:
+                _ = self.create_control_download_entry(nodo_id)
+
+        return {'status':'OK' }, 200
+
+
+# DEPRECATED
+"""
+   def get_last_data_id(self, dlgid):
+        '''
+        Busca si hay algún registro en la BD:tb_control_download con la tupla username_id/equipo_id.
+        Si la hay, retorna el valor de last_data_id.
+        Si no la hay, tenemos que inicializar creando un registro con el last_data_id = 0 y también
+        retornarlo.
+        Return:
+        None: en caso de error
+        Int: id.
+        '''
+
+        #print(f"DEBUG: dlgid={dlgid}, username={auth.current_user()}")
+              
+        scalar_subq_cliente_id = (
+            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        ).scalar_subquery()
+
+        scalar_subq_dlgid = (
+            select(self.tables.tb_equipos_validos.c.id).where ( 
+                and_(
+                    self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"),
+                    self.tables.tb_equipos_validos.c.cliente_id == scalar_subq_cliente_id
+                )
+            )
+        ).scalar_subquery()
+
+        sel = select(self.tables.tb_control_download.c.last_data_id).where(
+                and_(
+                    self.tables.tb_control_download.c.cliente_id == scalar_subq_cliente_id,
+                    self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid
+                )
+            )
+        #
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [get_last_data_id] no puedo conectarme a la BD.")
+            return None
+        #
+        try:
+            rp = self.bd.conn.execute(sel,{'username': auth.current_user(), 'dlgid':dlgid })
+        except Exception as ex:
+            print(f'ApiQlik ERROR [get_last_data_id] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return None           
+
+        res = rp.fetchone()
+        #print(f'DEBUG1::get_last_data_id: dlgid={dlgid}, res={res}')
+        if res is None:
+            '''
+            No hay registro
+            Debo inicializar el registro username,dlgid,row
+            '''
+            print(f"El equipo {dlgid} no esta inicializado o no pertence al usuario {auth.current_user()}")
+            self.bd.close()
+            return None
+        #
+        return res[0]
+       
+    def read_dlgids(self):
+        '''
+        Funcion que propiamente lee la lista de la BD perteneciente al usuario logueado
+        Modificacion 2024-11-28: 
+        En la consulta usamos el username de modo que las listas de dlgid son de
+        cada usuario
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [bd_read_dlgids] no puedo conectarme a la BD.")
+            return None
+        #
+        scalar_subq_cliente_id = (
+            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        ).scalar_subquery()
+        #
+        sel  = select( self.tables.tb_equipos_validos.c.dlgid ).where( 
+            self.tables.tb_equipos_validos.c.cliente_id == scalar_subq_cliente_id 
+            )
+        #
+        try:
+            rp = self.bd.conn.execute( sel, {'username':auth.current_user()})    
+        except Exception as ex:
+            print(f'ApiQlik ERROR [bd_read_dlgids] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return None
+
+        l_dlgids = []
+        for t in rp.fetchall():
+            l_dlgids.append(t[0])
+
+        self.bd.close()
+        return l_dlgids
+
+    def insert_dlgid(self, dlgid):
+        '''
+        Funcion que inserta el dlgid en la BD
+        Modificacion 2024-11-28:
+        Agregamos como parámetro el cliente_id de modo que las listas sean pesonificadas.
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [bd_insert_dlgid] no puedo conectarme a la BD.")
+            return False
+        #
+        scalar_subq_cliente_id = (
+            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        ).scalar_subquery()
+            
+        ins  = insert( self.tables.tb_equipos_validos ).values(dlgid = bindparam('dlgid'), cliente_id = scalar_subq_cliente_id )
+        try:
+            rp = self.bd.conn.execute( ins, { 'dlgid':dlgid, 'username':auth.current_user() } )
+        except Exception as ex:
+            print(f'ApiQlik ERROR [bd_insert_dlgid] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return False
+
+        self.bd.commit()
+        self.bd.close()
+        return True
+
+    def get_last_data_ids(self, l_dlgids):
+        '''
+        Toma una lista de dlgids y retorna una lista con tuplas (dlgid/last_data_id)
+        '''
+        l_last_data_ids = []
+        for dlgid in l_dlgids:
+            last_data_id = self.get_last_data_id(dlgid)
+            if last_data_id is None:
+                print(f"ApiQlik ERROR [get_last_data_ids] no puedo inicializar la BD.")
+                return None
+            else:
+                l_last_data_ids.append( (dlgid, last_data_id) )
+        return l_last_data_ids
+  
+    def update_last_ids(self, d_last_id):
+        for dlgid, last_data_id in d_last_id.items():
+            self.update_last_id(dlgid, last_data_id)
+
+    def reset_control_download(self, l_dlgids):
+        '''
+        Recibe una lista de dlgid_id y para el usuario dado, borra las 
+        entradas de la tabla tb_control_download
+        '''
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [reset_control_download] no puedo conectarme a la BD.")
+            return None
+        #
+        scalar_subq_user_id = (
+            select(self.tables.tb_clientes.c.id).where ( self.tables.tb_clientes.c.username == bindparam("username"))
+        ).scalar_subquery()
+        
+        scalar_subq_dlgid_id = (
+            select(self.tables.tb_equipos_validos.c.id).where ( self.tables.tb_equipos_validos.c.dlgid == bindparam("dlgid"))
+        ).scalar_subquery()    
+        
+        delstmt = delete( self.tables.tb_control_download).where(
+            and_(
+                self.tables.tb_control_download.c.cliente_id == scalar_subq_user_id,
+                self.tables.tb_control_download.c.dlgid_id == scalar_subq_dlgid_id
+            )
+        )
+
+        for dlgid in l_dlgids:
+            try:
+                _ = self.bd.conn.execute(delstmt,{'username':auth.current_user(), 'dlgid':dlgid })    
+            except Exception as ex:
+                print(f'ApiQlik ERROR [reset_control_download] DATA EXCEPTION: {ex}')
+                self.bd.rollback()
+                self.bd.close()
+                return False
+        
+        self.bd.conn.commit()
+        self.bd.close()
+        return True
+
+"""
+"""
 class Read(Resource):
     ''' 
     Devuelve registros en modo csv sin marcarlos.
@@ -662,33 +816,34 @@ class Read(Resource):
         response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
         return response
 
-class Rollback(Resource, Utils):
+"""
+"""
+class Housekeeping(Resource):
     ''' 
-    Devuelve hasta 5000 registros en modo csv de todos los dataloggers de una lista
-    que recibo por POST
+    Clase oculta para realizar tareas de mantenimiento
+    La tabla clientes no la puedo crear !!! ya que la uso para autentificarme
     '''
     def __init__(self):
-        Utils.__init__(self)
-
-    @auth.login_required
-    def post(self):
-        '''
-        Recibo un JSON con una lista de dataloggers.
-        '''
-        # Extraigo los datos del json ( es un diccionario serializado json)
-        params = request.get_json()
-        l_dlgids = params.get('l_dlgid',[])
-        '''
-        Paso 1: Selecciono los last_data_id para c/dlgid de l_dlgid.
-                Dejo en una lista tuplas (dlgid, last_data_id)
-        '''
-        if not self.reset_control_download(l_dlgids):
-            return {'status':'ERR', 'code': 404, 'rsp':'ERROR Rollback'}
+        self.bd = Bd()
+        self.tables = scm
         
-        return {'status':'OK'}, 200 
+    @auth.login_required
+    def get(self):
+        '''
+        '''
+        parser = reqparse.RequestParser()
+        parser.add_argument('action',type=str,location='args',required=True)
+        args=parser.parse_args()
+        action = args['action']
 
+        if action == 'CREATE_DATABASES':
+            conn = self.bd.connect()
+            self.tables.metadata.create_all(self.bd.get_engine())
+            return {'status':'OK', 'rsp':'CREATE_DATABASES'}, 200   
 
-# DEPRECATED
+        return {'status':'OK', 'rsp':'NO ACTION'}, 200  
+"""
+"""
 class Download(Resource):
     ''' 
     Devuelve hasta 5000 registros en modo csv.
@@ -756,17 +911,17 @@ class Download(Resource):
         response = Response(csv_data, content_type="text/csv")
         response.headers["Content-Disposition"] = "attachment; filename=datos.csv"
         return response
- 
+"""
+
 api.add_resource( Ping, '/apiqlik/ping')
 api.add_resource( Help, '/apiqlik/help')
 api.add_resource( Dlgids, '/apiqlik/dlgids')
-api.add_resource( Download, '/apiqlik/download')
 api.add_resource( DownloadDlgid, '/apiqlik/download_dlgid')
-api.add_resource( DownloadDlgidList, '/apiqlik/download_dlgid_list')
-api.add_resource( Read, '/apiqlik/read')
 api.add_resource( Rollback, '/apiqlik/rollback')
-
-#api.add_resource( Housekeeping, '/apiqlik/housekeeping')
+api.add_resource( DownloadDlgidList, '/apiqlik/download_dlgid_list')
+api.add_resource( Housekeeping, '/apiqlik/housekeeping')
+#api.add_resource( Download, '/apiqlik/download')
+#api.add_resource( Read, '/apiqlik/read')
 
 if __name__ != '__main__':
     gunicorn_logger = logging.getLogger('gunicorn.error')

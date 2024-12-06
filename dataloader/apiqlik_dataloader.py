@@ -115,7 +115,7 @@ class Dataloader:
             self.bd.close()
             return
         
-        sel  = select( self.tables.tb_equipos_validos.c.dlgid )
+        sel  = select( self.tables.tb_equipos.c.dlgid )
         try:
             rp = self.bd.conn.execute( sel )
         except Exception as ex:
