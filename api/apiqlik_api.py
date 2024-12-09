@@ -25,6 +25,11 @@ bd=Bd()
 conn = bd.connect()
 scm.metadata.create_all(bd.get_engine())
 
+VERSION 2.0.1 @ 2024-12-09
+Hay un bug cuando se leen todos los datos, que al no quedar más datos, devuelve
+un rp vacio, entonces el last_data_id es 0, y queda como si hubiesemos hecho un rollback.
+
+
 VERSION 2.0 @ 2024-11-28
 Las tablas de dataloggers deben ser por usuario. Cada usuario va a tener su propia
 lista de equipos en los que puede trabajar.
@@ -51,7 +56,7 @@ import json
 from flask import Flask, request, jsonify,  Response
 from flask_restful import Resource, Api, reqparse
 from flask_httpauth import HTTPBasicAuth
-from sqlalchemy import select, delete, bindparam, update, Text, and_
+from sqlalchemy import select, delete, bindparam, update, Text, and_, desc
 from sqlalchemy.dialects.postgresql import insert
 import datetime as dt
 from base_datos import Bd
@@ -352,6 +357,45 @@ class Utils:
         self.bd.close()
         return True
 
+    def get_data_id_by_fecha(self, dlgid, fecha):
+        '''
+        Busca en la tabla de datos el primer id que corresponde al dlgid a partir
+        de la fecha dada
+        '''
+        if dlgid is None:
+            return 0
+        
+        if fecha is None:
+            return 0
+        
+        if not self.bd.connect():
+            print(f"ApiQlik ERROR [get_data_id_by_fecha] no puedo conectarme a la BD.")
+            return False
+        
+        sel = select(self.tables.tb_datos.c.id).where(
+                and_(
+                    self.tables.tb_datos.c.dlgid == bindparam("dlgid"),
+                    self.tables.tb_datos.c.fechadata >= bindparam("fechadata")
+                )
+            ).order_by(self.tables.tb_datos.c.fechadata.asc()).limit(1)
+        
+        # Armo una lista con tuplas donde c/u tiene el dlgid y el iterable con los resultados
+        try:
+            rp = self.bd.conn.execute(sel,{'dlgid':dlgid, 'fechadata':fecha })
+        except Exception as ex:
+            print(f'ApiQlik ERROR [get_data_id_by_fecha] DATA EXCEPTION: {ex}')
+            self.bd.close()
+            return None
+        #
+        res = rp.fetchone()
+        self.bd.close()
+        if res:
+            id = res[0]
+        else:
+            id = 0
+        
+        return id
+
 class Ping(Resource):
     '''
     Prueba la conexion a la SQL
@@ -375,10 +419,11 @@ class Help(Resource):
             'GET /apiqlik/help':'Esta pantalla de ayuda',
             'GET /apiqlik/dlgids':'Devuelve la lista de dlgids validos',
             'PUT /apiqlik/dlgids':'Agrega un nuevo dlgid al sistema',
-            'GET /apiqlik/download_data':'Devuelve todos los datos',
             'GET /apiqlik/download_dlgid':'Permite seleccionar dlgid',
             'POST /apiqlik/download_dlgid_list':'Baja los datos de una lista de dlgids',
             'POST /apiqlik/rollback':'Borra los datos de una lista de dlgids',
+            'POST /apiqlik/rollback_by_date':'Borra los datos de un dlgid a partir de una fecha',
+
         }
         return d_options, 200
 
@@ -473,7 +518,7 @@ class DownloadDlgid(Resource, Utils):
         #print(f"DEBUG::DownloadDlgid Last Row={last_data_id}")
         #
         # Actualizo el ultimo registro en Control_acceso para el dlgid y el usuario dado
-        if nro_lines > 0:
+        if ( nro_lines > 0 ) and ( last_data_id > 0 ):
             #self.update_last_id(dlgid, last_data_id) 
             self.update_last_id(dlgid, last_data_id) 
         #
@@ -505,6 +550,31 @@ class Rollback(Resource, Utils):
         
         return {'status':'OK'}, 200 
 
+class Rollback_by_date(Resource, Utils):
+    '''
+    Recibe un json con el dlgid y la fecha para inicializar el last_data_id
+    '''
+    def __init__(self):
+        Utils.__init__(self)
+
+    @auth.login_required
+    def post(self):
+        '''
+        Recibo un JSON el dlgid y la fecha del ultimo dato para actualizar
+        Busco el id en la tabla de datos para el dlgid y la fecha dada
+        Actualizo el nodo correspndiente con el id.
+        '''
+        # Extraigo los datos del json ( es un diccionario serializado json)
+        params = request.get_json()
+        dlgid = params.get('dlgid', None)
+        fecha_last_data = params.get('fecha','2020-01-01')
+        #
+        last_data_id = self.get_data_id_by_fecha(dlgid, fecha_last_data)
+        if self.update_last_id(dlgid, last_data_id):
+            return {'status':'OK'}, 200 
+        else:
+            return {'status':'FAIL'}, 400 
+
 class DownloadDlgidList(Resource, Utils):
     ''' 
     Devuelve hasta 5000 registros en modo csv de todos los dataloggers de una lista
@@ -528,7 +598,7 @@ class DownloadDlgidList(Resource, Utils):
         csv_data = ""
         nro_lines_in_csv = 0
         
-        for (dlgid) in l_dlgids:
+        for dlgid in l_dlgids:
             read_lines = maxlines - nro_lines_in_csv
             if read_lines > 0:
                 # Si queda espacio, sigo leyendo
@@ -542,7 +612,8 @@ class DownloadDlgidList(Resource, Utils):
                     last_data_id = id
                 #
                 # Actualizo el ultimo registro en Control_acceso para el dlgid y el usuario dado
-                self.update_last_id(dlgid, last_data_id) 
+                if last_data_id > 0:
+                    self.update_last_id(dlgid, last_data_id) 
             else:
                 # No queda mas espacio en el csv: salgo
                 break
@@ -918,6 +989,7 @@ api.add_resource( Help, '/apiqlik/help')
 api.add_resource( Dlgids, '/apiqlik/dlgids')
 api.add_resource( DownloadDlgid, '/apiqlik/download_dlgid')
 api.add_resource( Rollback, '/apiqlik/rollback')
+api.add_resource( Rollback_by_date, '/apiqlik/rollback_by_date')
 api.add_resource( DownloadDlgidList, '/apiqlik/download_dlgid_list')
 api.add_resource( Housekeeping, '/apiqlik/housekeeping')
 #api.add_resource( Download, '/apiqlik/download')
